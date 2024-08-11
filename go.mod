@@ -8,6 +8,7 @@ require (
 	github.com/go-sql-driver/mysql v1.5.1-0.20200531100419-12508c83901b
 	github.com/juju/errors v0.0.0-20220203013757-bd733f3c86b9
 	github.com/siddontang/go-log v0.0.0-20190221022429-1e957dd83bed
+	golang.org/x/term v0.23.0
 )
 
 require (
@@ -17,6 +18,7 @@ require (
 	github.com/shopspring/decimal v1.2.1-0.20200707070546-867ed12000cf // indirect
 	github.com/siddontang/go v0.0.0-20180604090527-bdc77568d726 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
+	golang.org/x/sys v0.23.0 // indirect
 )
 
 replace github.com/go-mysql-org/go-mysql => github.com/liuhr/go-mysql v0.0.0-20221109130012-ad3338a67e8f

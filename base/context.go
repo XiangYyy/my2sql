@@ -15,6 +15,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/siddontang/go-log/log"
+	"golang.org/x/term"
 )
 
 const (
@@ -76,10 +77,11 @@ type ConfCmd struct {
 	WorkType  string
 	MysqlType string
 
-	Host     string
-	Port     uint
-	User     string
-	Passwd   string
+	Host   string
+	Port   uint
+	User   string
+	Passwd string
+	// AskPasswd bool
 	ServerId uint
 
 	Databases []string
@@ -190,7 +192,8 @@ func (this *ConfCmd) ParseCmdOptions() {
 	flag.StringVar(&this.Host, "host", "127.0.0.1", "mysql host, default 127.0.0.1 .")
 	flag.UintVar(&this.Port, "port", 3306, "mysql port, default 3306.")
 	flag.StringVar(&this.User, "user", "", "mysql user. ")
-	flag.StringVar(&this.Passwd, "password", "", "mysql user password.")
+	flag.StringVar(&this.Passwd, "password", "nil", "mysql user password.if not given,asked from the tty.")
+	// flag.BoolVar(&this.AskPasswd, "askpass", false, "交互输入密码")
 	flag.UintVar(&this.ServerId, "server-id", 1113306, "this program replicates from mysql as slave to read binlogs. Must set this server id unique from other slaves, default 1113306")
 
 	flag.StringVar(&dbs, "databases", "", "only parse these databases, comma seperated, default all.")
@@ -428,6 +431,16 @@ func (this *ConfCmd) CheckCmdOptions() {
 	// check --threads
 	if this.Threads != uint(this.GetDefaultValueOfRange("Threads")) {
 		this.CheckValueInRange("Threads", int(this.Threads), "value of -t out of range", true)
+	}
+
+	if this.Passwd == "nil" {
+		fmt.Print("Enter Password:")
+		fd := int(os.Stdin.Fd())
+		password, err := term.ReadPassword(fd)
+		if err != nil {
+			log.Fatal(err)
+		}
+		this.Passwd = string(password)
 	}
 
 }

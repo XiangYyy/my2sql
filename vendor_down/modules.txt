@@ -36,4 +36,8 @@ github.com/siddontang/go-log/loggers
 # go.uber.org/atomic v1.7.0
 ## explicit; go 1.13
 go.uber.org/atomic
+# golang.org/x/sys v0.23.0
+## explicit; go 1.18
+# golang.org/x/term v0.23.0
+## explicit; go 1.18
 # github.com/go-mysql-org/go-mysql => github.com/liuhr/go-mysql v0.0.0-20221109130012-ad3338a67e8f
