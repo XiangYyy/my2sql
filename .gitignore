@@ -7,3 +7,4 @@ main
 .vendor/go19
 /bin
 /build
+my2sql
