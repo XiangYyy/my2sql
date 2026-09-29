@@ -2,9 +2,8 @@ package base
 
 import (
 	"fmt"
-	"github.com/siddontang/go-log/log"
 	"github.com/go-mysql-org/go-mysql/mysql"
-        "github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/replication"
 	SQL "my2sql/sqlbuilder"
 	toolkits "my2sql/toolkits"
 	"strings"
@@ -167,7 +166,7 @@ func GenInsertSqlsForOneRowsEvent(posStr string, rEv *replication.RowsEvent, col
 		endIndex = GetMinValue(rowCnt, i+rowsPerSql)
 		oneSql, err = GenInsertSqlForRows(rEv.Rows[i:endIndex], insertSql, schema, ifprefixDb, ifIgnorePrimary, primaryIdx)
 		if err != nil {
-			log.Fatalf(fmt.Sprintf("Fail to generate %s sql for %s %s \n\terror: %v\n\trows data:%v",
+			panic(fmt.Errorf("Fail to generate %s sql for %s %s \n\terror: %v\n\trows data:%v",
 				sqlType, GetAbsTableName(schema, table), posStr, err, rEv.Rows[i:endIndex]))
 		} else {
 			sqlArr = append(sqlArr, oneSql)
@@ -179,7 +178,7 @@ func GenInsertSqlsForOneRowsEvent(posStr string, rEv *replication.RowsEvent, col
 		insertSql = SQL.NewTable(table, newColDefs...).Insert(newColDefs...)
 		oneSql, err = GenInsertSqlForRows(rEv.Rows[endIndex:rowCnt], insertSql, schema, ifprefixDb, ifIgnorePrimary, primaryIdx)
 		if err != nil {
-			log.Fatalf(fmt.Sprintf("Fail to generate %s sql for %s %s \n\terror: %s\n\trows data:%v",
+			panic(fmt.Errorf("Fail to generate %s sql for %s %s \n\terror: %s\n\trows data:%v",
 				sqlType, GetAbsTableName(schema, table), posStr, err, rEv.Rows[endIndex:rowCnt]))
 		} else {
 			sqlArr = append(sqlArr, oneSql)
@@ -256,7 +255,7 @@ func GenDeleteSqlsForOneRowsEvent(posStr string, rEv *replication.RowsEvent, col
 
 		sql, err := SQL.NewTable(table, colDefs...).Delete().Where(SQL.And(whereCond...)).String(schemaInSql)
 		if err != nil {
-			log.Fatalf(fmt.Sprintf("Fail to generate %s sql for %s %s \n\terror: %s\n\trows data:%v",
+			panic(fmt.Errorf("Fail to generate %s sql for %s %s \n\terror: %s\n\trows data:%v",
 				sqlType, GetAbsTableName(schema, table), posStr, err, row))
 			//continue
 		}
@@ -321,7 +320,7 @@ func GenUpdateSqlsForOneRowsEvent(posStr string, colsTypeNameFromMysql []string,
 		upSql.Where(SQL.And(wherePart...))
 		sql, err = upSql.String(schemaInSql)
 		if err != nil {
-			log.Fatalf(fmt.Sprintf("Fail to generate %s sql for %s %s \n\terror: %s\n\trows data:%v\n%v",
+			panic(fmt.Errorf("Fail to generate %s sql for %s %s \n\terror: %s\n\trows data:%v\n%v",
 				sqlType, GetAbsTableName(schema, table), posStr, err, rEv.Rows[i], rEv.Rows[i+1]))
 		} else {
 			sqlArr = append(sqlArr, sql)

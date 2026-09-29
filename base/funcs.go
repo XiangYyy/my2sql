@@ -8,15 +8,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/siddontang/go-log/log"
 	MyPos "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/siddontang/go-log/log"
 	toolkits "my2sql/toolkits"
 )
 
 func IntSliceToString(iArr []int, sep string, prefix string) string {
 	sArr := make([]string, len(iArr))
-	for _, v := range iArr {
-		sArr = append(sArr, string(v))
+	for i, v := range iArr {
+		sArr[i] = strconv.Itoa(v)
 	}
 
 	return prefix + " " + strings.Join(sArr, sep)
@@ -83,10 +83,10 @@ func GetBinlogBasenameAndIndex(binlog string) (string, int) {
 	return baseName, indx
 }
 
-func GetFiledType(filed string) string{
+func GetFiledType(filed string) string {
 	arr := strings.Split(filed, "(")
 	if len(arr) < 1 {
-		log.Fatalf("get feild is null %s",filed)
+		log.Fatalf("get feild is null %s", filed)
 	}
 	return arr[0]
 }
@@ -177,5 +177,3 @@ func CompareEquelByteSlice(s1 []byte, s2 []byte) bool {
 	}
 	return true
 }
-
-

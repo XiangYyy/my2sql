@@ -11,7 +11,7 @@ func GetSystemHomeNameAndAdderss() (hostname string, address string) {
 	// get system hostname
 	host, err := os.Hostname()
 	if err != nil {
-		log.Error("%v %s", err, "fail to get system hostname")
+		log.Errorf("%v %s", err, "fail to get system hostname")
 
 	} else {
 		hostname = host
@@ -20,7 +20,7 @@ func GetSystemHomeNameAndAdderss() (hostname string, address string) {
 	// get system address
 	netInterfaces, err := net.Interfaces()
 	if err != nil {
-		log.Error("%v %s", err, "fail to get system adderss")
+		log.Errorf("%v %s", err, "fail to get system adderss")
 	}
 	for i := 0; i < len(netInterfaces); i++ {
 		if (netInterfaces[i].Flags & net.FlagUp) != 0 {

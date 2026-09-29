@@ -1,14 +1,13 @@
 package base
 
 import (
-	"sync"
 	"path/filepath"
+	"sync"
 
-	"my2sql/dsql"
-	toolkits "my2sql/toolkits"
-	"github.com/siddontang/go-log/log"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	"my2sql/dsql"
+	toolkits "my2sql/toolkits"
 )
 
 type BinEventHandlingIndx struct {
@@ -35,6 +34,12 @@ type MyBinEvent struct {
 	OrgSql      string        // for ddl and binlog which is not row format
 }
 
+// ReachedAutoStop 使用下一文件的排他边界，不以候选末文件的末事件位置停止。
+func (cfg *ConfCmd) ReachedAutoStop(file string) bool {
+	return cfg.AutoStopBeforeFile != "" &&
+		(mysql.Position{Name: file, Pos: 4}).Compare(mysql.Position{Name: cfg.AutoStopBeforeFile, Pos: 4}) >= 0
+}
+
 func (this *MyBinEvent) CheckBinEvent(cfg *ConfCmd, ev *replication.BinlogEvent, currentBinlog *string) int {
 	myPos := mysql.Position{Name: *currentBinlog, Pos: ev.Header.LogPos}
 
@@ -42,20 +47,26 @@ func (this *MyBinEvent) CheckBinEvent(cfg *ConfCmd, ev *replication.BinlogEvent,
 		rotatEvent := ev.Event.(*replication.RotateEvent)
 		*currentBinlog = string(rotatEvent.NextLogName)
 		this.IfRowsEvent = false
+		if cfg.ReachedAutoStop(*currentBinlog) {
+			return C_reBreak
+		}
 		return C_reContinue
+	}
+
+	if cfg.ReachedAutoStop(*currentBinlog) {
+		return C_reBreak
 	}
 
 	if cfg.IfSetStartFilePos {
 		cmpRe := myPos.Compare(cfg.StartFilePos)
-		if cmpRe == -1 {
+		if cmpRe <= 0 {
 			return C_reContinue
 		}
 	}
 
 	if cfg.IfSetStopFilePos {
 		cmpRe := myPos.Compare(cfg.StopFilePos)
-		if cmpRe >= 0 {
-			log.Infof("stop to get event. StopFilePos set. currentBinlog %s StopFilePos %s", myPos.String(), cfg.StopFilePos.String())
+		if cmpRe > 0 {
 			return C_reBreak
 		}
 	}
@@ -68,8 +79,7 @@ func (this *MyBinEvent) CheckBinEvent(cfg *ConfCmd, ev *replication.BinlogEvent,
 
 	if cfg.IfSetStopDateTime {
 		if ev.Header.Timestamp >= cfg.StopDatetime {
-			log.Infof("stop to get event. StopDateTime set. current event Timestamp %d Stop DateTime  Timestamp %d", ev.Header.Timestamp, cfg.StopDatetime)
-			return C_reBreak
+			return C_reContinue
 		}
 	}
 	if cfg.FilterSqlLen == 0 {
@@ -159,26 +169,25 @@ BinEventCheck:
 
 }
 
-
-func CheckBinHeaderCondition(cfg *ConfCmd, header *replication.EventHeader, currentBinlog string) (int) {
+func CheckBinHeaderCondition(cfg *ConfCmd, header *replication.EventHeader, currentBinlog string) int {
 	// process: 0, continue: 1, break: 2
 
 	myPos := mysql.Position{Name: currentBinlog, Pos: header.LogPos}
 	//fmt.Println(cfg.StartFilePos, cfg.IfSetStopFilePos, myPos)
 	if cfg.IfSetStartFilePos {
 		cmpRe := myPos.Compare(cfg.StartFilePos)
-		if cmpRe == -1 {
+		if cmpRe <= 0 {
 			return C_reContinue
 		}
 	}
 
 	if cfg.IfSetStopFilePos {
 		cmpRe := myPos.Compare(cfg.StopFilePos)
-		if cmpRe >= 0 {
+		if cmpRe > 0 {
 			return C_reBreak
 		}
 	}
-	
+
 	//fmt.Println(cfg.StartDatetime, cfg.StopDatetime, header.Timestamp)
 	if cfg.IfSetStartDateTime {
 
@@ -189,7 +198,7 @@ func CheckBinHeaderCondition(cfg *ConfCmd, header *replication.EventHeader, curr
 
 	if cfg.IfSetStopDateTime {
 		if header.Timestamp >= cfg.StopDatetime {
-			return C_reBreak
+			return C_reContinue
 		}
 	}
 	if cfg.FilterSqlLen == 0 {

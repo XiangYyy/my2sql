@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"time"
 
 	constvar "my2sql/constvar"
@@ -48,7 +50,7 @@ var (
 	GUseDatabase string = ""
 
 	GOptsValidMode      []string = []string{"repl", "file"}
-	GOptsValidWorkType  []string = []string{"2sql", "rollback", "stats"}
+	GOptsValidWorkType  []string = []string{"2sql", "rollback", "stats", "binlogs"}
 	GOptsValidMysqlType []string = []string{"mysql", "mariadb"}
 	GOptsValidFilterSql []string = []string{"insert", "update", "delete"}
 
@@ -94,6 +96,10 @@ type ConfCmd struct {
 	IgnoreTables    []string
 	FilterSql       []string
 	FilterSqlLen    int
+
+	AutoPosition       bool
+	ExplicitFilePos    bool
+	AutoStopBeforeFile string
 
 	StartFile         string
 	StartPos          uint
@@ -161,8 +167,15 @@ type ConfCmd struct {
 	//DdlFH     *os.File
 	BiglongFH *os.File
 
-	BinlogStreamer *replication.BinlogStreamer
-	FromDB         *sql.DB
+	BinlogStreamer   *replication.BinlogStreamer
+	CloseReplication func()
+	FromDB           *sql.DB
+
+	resultMu    sync.Mutex
+	firstError  error
+	statsClosed bool
+	// Optional output factory for offline fault injection.
+	openOutput func(string) (io.WriteCloser, error)
 }
 
 func (this *ConfCmd) ParseCmdOptions() {
@@ -186,7 +199,7 @@ func (this *ConfCmd) ParseCmdOptions() {
 
 	flag.BoolVar(&version, "v", false, "print version")
 	flag.StringVar(&this.Mode, "mode", "repl", StrSliceToString(GOptsValidMode, C_joinSepComma, C_validOptMsg)+". repl: as a slave to get binlogs from master. file: get binlogs from local filesystem. default repl")
-	flag.StringVar(&this.WorkType, "work-type", "2sql", StrSliceToString(GOptsValidWorkType, C_joinSepComma, C_validOptMsg)+". 2sql: convert binlog to sqls, rollback: generate rollback sqls, stats: analyze transactions. default: 2sql")
+	flag.StringVar(&this.WorkType, "work-type", "2sql", StrSliceToString(GOptsValidWorkType, C_joinSepComma, C_validOptMsg)+". 2sql: convert binlog to sqls, rollback: generate rollback sqls, stats: analyze transactions, binlogs: 查询远程 MySQL binlog 候选文件及估算时间. default: 2sql")
 	flag.StringVar(&this.MysqlType, "mysql-type", "mysql", StrSliceToString(GOptsValidMysqlType, C_joinSepComma, C_validOptMsg)+". server of binlog, mysql or mariadb, default mysql")
 
 	flag.StringVar(&this.Host, "host", "127.0.0.1", "mysql host, default 127.0.0.1 .")
@@ -203,6 +216,7 @@ func (this *ConfCmd) ParseCmdOptions() {
 	flag.StringVar(&sqlTypes, "sql", "", StrSliceToString(GOptsValidFilterSql, C_joinSepComma, C_validOptMsg)+". only parse these types of sql, comma seperated, valid types are: insert, update, delete; default is all(insert,update,delete)")
 	flag.BoolVar(&this.IgnorePrimaryKeyForInsert, "ignore-primaryKey-forInsert", false, "for insert statement when -workType=2sql, ignore primary key")
 
+	flag.BoolVar(&this.AutoPosition, "auto-position", true, "纯时间解析时自动探测远程 MySQL 候选文件；抽样不保证覆盖所有乱序事件，设为 false 恢复原路径")
 	flag.StringVar(&this.StartFile, "start-file", "", "binlog file to start reading")
 	flag.UintVar(&this.StartPos, "start-pos", 4, "start reading the binlog at position")
 	flag.StringVar(&this.StopFile, "stop-file", "", "binlog file to stop reading")
@@ -229,6 +243,12 @@ func (this *ConfCmd) ParseCmdOptions() {
 	flag.UintVar(&this.Threads, "threads", uint(this.GetDefaultValueOfRange("Threads")), "Works with -workType=2sql|rollback. threads to run")
 
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "start-file", "start-pos", "stop-file", "stop-pos":
+			this.ExplicitFilePos = true
+		}
+	})
 
 	if version {
 		fmt.Printf("%s\n", C_Version)
@@ -237,22 +257,6 @@ func (this *ConfCmd) ParseCmdOptions() {
 
 	if this.Mode != "repl" && this.Mode != "file" {
 		log.Fatalf("unsupported mode=%s, valid modes: file, repl", this.Mode)
-	}
-
-	// check --output-dir
-	if this.OutputDir != "" {
-		// auto make output directory
-		// ifExist, errMsg := CheckIsDir(this.OutputDir)
-		ifExist, _ := CheckIsDir(this.OutputDir)
-		if !ifExist {
-			log.Infof("%s not exists,auto mkdir.", this.OutputDir)
-			if err := os.MkdirAll(this.OutputDir, os.ModePerm); err != nil {
-				log.Fatalf("mkdir %s faild", err)
-			}
-			// log.Fatalf("OutputDir -o=%s DIR_NOT_EXISTS", errMsg)
-		}
-	} else {
-		this.OutputDir, _ = os.Getwd()
 	}
 
 	if !doNotAddPrifixDb {
@@ -298,6 +302,9 @@ func (this *ConfCmd) ParseCmdOptions() {
 		if err != nil {
 			log.Fatalf("invalid start datetime -start-datetime " + startTime)
 		}
+		if t.Unix() < 0 || t.Unix() > int64(^uint32(0)) {
+			log.Fatal("start-datetime 超出 binlog 时间戳范围")
+		}
 		this.StartDatetime = uint32(t.Unix())
 		this.IfSetStartDateTime = true
 	} else {
@@ -308,6 +315,9 @@ func (this *ConfCmd) ParseCmdOptions() {
 		t, err := time.ParseInLocation(constvar.DATETIME_FORMAT, stopTime, GBinlogTimeLocation)
 		if err != nil {
 			log.Fatalf("invalid stop datetime -stop-datetime " + stopTime)
+		}
+		if t.Unix() < 0 || t.Unix() > int64(^uint32(0)) {
+			log.Fatal("stop-datetime 超出 binlog 时间戳范围")
 		}
 		this.StopDatetime = uint32(t.Unix())
 		this.IfSetStopDateTime = true
@@ -339,6 +349,10 @@ func (this *ConfCmd) ParseCmdOptions() {
 		this.IfSetStopParsPoint = false
 	}
 
+	if err := this.ValidateBinlogOptions(); err != nil {
+		log.Fatal(err)
+	}
+
 	if this.Mode == "file" {
 
 		if this.StartFile == "" {
@@ -364,16 +378,49 @@ func (this *ConfCmd) ParseCmdOptions() {
 		}
 	}
 
+	this.CheckCmdOptions()
+}
+
+func (this *ConfCmd) ValidateBinlogOptions() error {
+	if this.WorkType == "binlogs" {
+		if this.Mode != "repl" || this.MysqlType != "mysql" {
+			return fmt.Errorf("-work-type binlogs 仅支持 -mode repl -mysql-type mysql")
+		}
+		if this.ExplicitFilePos || this.StartFile != "" || this.StopFile != "" || this.LocalBinFile != "" {
+			return fmt.Errorf("-work-type binlogs 不接受文件或 Pos 参数，请使用起止时间筛选")
+		}
+	}
+	if (this.WorkType == "binlogs" || this.ShouldAutoPosition()) && (this.ServerId == 0 || uint64(this.ServerId) > uint64(^uint32(0))) {
+		return fmt.Errorf("-server-id 必须介于 1 和 4294967295，且不得与其他副本重复")
+	}
+	return nil
+}
+
+// InitOutput 只能在查询分流和自动定位成功之后调用。
+func (this *ConfCmd) InitOutput() error {
+	if this.WorkType == "binlogs" {
+		return nil
+	}
+	if this.OutputDir == "" {
+		var err error
+		this.OutputDir, err = os.Getwd()
+		if err != nil {
+			return err
+		}
+	} else if err := os.MkdirAll(this.OutputDir, os.ModePerm); err != nil {
+		return fmt.Errorf("创建输出目录失败: %w", err)
+	}
 	this.EventChan = make(chan MyBinEvent, this.Threads*2)
 	this.StatChan = make(chan BinEventStats, this.Threads*2)
 	this.SqlChan = make(chan ForwardRollbackSqlOfPrint, this.Threads*2)
-	this.StatChan = make(chan BinEventStats, this.Threads*2)
-	this.OpenStatsResultFiles()
-	this.OpenTxResultFiles()
-
-	this.CheckCmdOptions()
-	this.CreateDB()
-
+	if err := this.OpenStatsResultFiles(); err != nil {
+		return err
+	}
+	if err := this.OpenTxResultFiles(); err != nil {
+		this.CloseFH()
+		return err
+	}
+	return nil
 }
 
 func (this *ConfCmd) CheckCmdOptions() {
@@ -434,7 +481,7 @@ func (this *ConfCmd) CheckCmdOptions() {
 	}
 
 	if this.Passwd == "nil" {
-		fmt.Print("Enter Password:")
+		fmt.Fprint(os.Stderr, "Enter Password:")
 		fd := int(os.Stdin.Fd())
 		password, err := term.ReadPassword(fd)
 		if err != nil {
@@ -547,29 +594,57 @@ func (this *ConfCmd) IsTargetDml(dml string) bool {
 	}
 }
 
-func (this *ConfCmd) OpenStatsResultFiles() {
+func (this *ConfCmd) OpenStatsResultFiles() error {
 	statFile := filepath.Join(this.OutputDir, "binlog_status.txt")
 	statFH, err := os.OpenFile(statFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		log.Fatalf("fail to open file %v"+statFile, err)
+		return fmt.Errorf("打开统计文件 %s 失败: %w", statFile, err)
 	}
-	statFH.WriteString(GetStatsPrintHeaderLine(Stats_Result_Header_Column_names))
 	this.StatFH = statFH
+	if err = writeOutput(statFH, GetStatsPrintHeaderLine(Stats_Result_Header_Column_names)); err != nil {
+		this.RecordError(err)
+		this.CloseFH()
+		return err
+	}
+	return nil
 }
 
-func (this *ConfCmd) OpenTxResultFiles() {
+func (this *ConfCmd) OpenTxResultFiles() error {
 	biglongFile := filepath.Join(this.OutputDir, "biglong_trx.txt")
 	biglongFH, err := os.OpenFile(biglongFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		log.Fatalf("fail to open file %v"+biglongFile, err)
+		return fmt.Errorf("打开事务文件 %s 失败: %w", biglongFile, err)
 	}
-	biglongFH.WriteString(GetBigLongTrxPrintHeaderLine(Stats_BigLongTrx_Header_Column_names))
 	this.BiglongFH = biglongFH
+	if err = writeOutput(biglongFH, GetBigLongTrxPrintHeaderLine(Stats_BigLongTrx_Header_Column_names)); err != nil {
+		this.RecordError(err)
+		this.CloseFH()
+		return err
+	}
+	return nil
 }
 
 func (this *ConfCmd) CloseFH() {
-	this.StatFH.Close()
-	this.BiglongFH.Close()
+	if this.statsClosed {
+		return
+	}
+	this.statsClosed = true
+	if this.StatFH != nil {
+		this.RecordError(this.StatFH.Close())
+	}
+	if this.BiglongFH != nil {
+		this.RecordError(this.BiglongFH.Close())
+	}
+}
+
+func (this *ConfCmd) CloseResources() {
+	if this.CloseReplication != nil {
+		this.CloseReplication()
+	}
+	this.CloseFH()
+	if this.FromDB != nil {
+		this.FromDB.Close()
+	}
 }
 
 func (this *ConfCmd) CloseChan() {
@@ -583,13 +658,17 @@ func (this *ConfCmd) CloseChan() {
 	}
 }
 
-func (this *ConfCmd) CreateDB() {
+func (this *ConfCmd) CreateDB() error {
 	url := GetMysqlUrl(this)
+	if this.WorkType == "binlogs" || this.ShouldAutoPosition() {
+		url += "&timeout=5s&readTimeout=5s&writeTimeout=5s"
+	}
 	db, err := CreateMysqlCon(url)
 	if err != nil {
-		log.Fatalf("Connect mysql failed %v", err)
+		return fmt.Errorf("连接 MySQL 失败: %w", err)
 	}
 	this.FromDB = db
+	return nil
 }
 
 func (this *ConfCmd) PrintUsageMsg() {

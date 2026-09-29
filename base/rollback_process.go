@@ -6,154 +6,91 @@ import (
 	"os"
 	"strings"
 	"sync"
-
-	"github.com/siddontang/go-log/log"
 )
 
-func ReverseFileGo(threadIdx int, rollbackFileChan chan map[string]string, bytesCntFiles map[string][][]int, keepTrx bool, wg *sync.WaitGroup) {
+func ReverseFileGo(threadIdx int, files chan map[string]string, lengths map[string][][]int, keepTrx bool, wg *sync.WaitGroup, cfg *ConfCmd) {
 	defer wg.Done()
-	log.Infof("start thread %d to revert rollback sql files", threadIdx)
-	for arr := range rollbackFileChan {
-		//ReverseFileToNewFile(arr["tmp"], arr["rollback"], batchLines)
-		//ReverseFileToNewFileOneByOneLineAndKeepTrx(arr["tmp"], arr["rollback"])
-		ReverseFileToNewFileOneByOneLineAndKeepTrxBatchRead(arr["tmp"], arr["rollback"], bytesCntFiles[arr["tmp"]], keepTrx)
-		err := os.Remove(arr["tmp"])
+	for pair := range files {
+		if cfg.Err() != nil {
+			continue
+		}
+		err := reverseFile(pair["tmp"], pair["rollback"], lengths[pair["tmp"]], keepTrx, cfg.newOutput)
 		if err != nil {
-			log.Fatalf("fail to remove tmp file %s", arr["tmp"])
+			cfg.RecordError(err)
+			continue
+		}
+		// The source is the only complete copy on any read/write/close failure.
+		if err := os.Remove(pair["tmp"]); err != nil {
+			cfg.RecordError(fmt.Errorf("remove tmp %s: %w", pair["tmp"], err))
 		}
 	}
-	log.Infof(fmt.Sprintf("exit thread %d to revert rollback sql files", threadIdx))
 }
 
-func ReverseFileToNewFileOneByOneLineAndKeepTrxBatchRead(srcFile string, destFile string, trxPoses [][]int, keepTrx bool) error {
-	var (
-		srcFH            *os.File
-		destFH           *os.File
-		err              error
-		srcInfo          os.FileInfo
-		readByteCntTotal int64 = 0
-		srcSize          int64
-		bufStr           string
-		LineSep          string = "\n"
-		lastTrxIdx       int    = 0
-	)
+func ReverseFileToNewFileOneByOneLineAndKeepTrxBatchRead(src, dest string, positions [][]int, keepTrx bool) error {
+	return reverseFile(src, dest, positions, keepTrx, (&ConfCmd{}).newOutput)
+}
 
-	log.Infof(fmt.Sprintf("start to revert tmp file %s into %s", srcFile, destFile))
-	srcFH, err = os.Open(srcFile)
-	if srcFH != nil {
-		defer srcFH.Close()
-	}
+func reverseFile(src, dest string, positions [][]int, keepTrx bool, open func(string) (io.WriteCloser, error)) (result error) {
+	in, err := os.Open(src)
 	if err != nil {
-		log.Errorf("fail to open tmp file %s", srcFile)
-		return err
+		return fmt.Errorf("open rollback tmp %s: %w", src, err)
 	}
-
-	destFH, err = os.OpenFile(destFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if destFH != nil {
-		defer destFH.Close()
-	}
-	if err != nil {
-		log.Errorf("fail to open file %s", destFile)
-		return err
-	}
-
-	srcInfo, err = srcFH.Stat()
-	if err != nil {
-		log.Errorf("fail to stat file %s", srcFile)
-		return err
-	}
-
-	srcSize = srcInfo.Size() //int64
-
-	//var ifCommit bool = true
-
-	_, err = srcFH.Seek(0, os.SEEK_END)
-	if err != nil {
-		log.Errorf("fail to seek file %s", srcFile)
-		return err
-	}
-
-	for batchIdx := len(trxPoses) - 1; batchIdx >= 0; batchIdx-- {
-
-		startPos, err := srcFH.Seek(-int64(trxPoses[batchIdx][0]), os.SEEK_CUR)
-		if err != nil {
-			log.Errorf("fail to seek file %s", srcFile)
-			return err
+	defer func() {
+		if err := in.Close(); result == nil && err != nil {
+			result = fmt.Errorf("close rollback tmp: %w", err)
 		}
-		var buf []byte = make([]byte, trxPoses[batchIdx][0])
-		//_, err = srcFH.Read(buf)
-		_, err = io.ReadFull(srcFH, buf)
-		if err != nil {
-			log.Errorf("fail to read file %s", srcFile)
-			return err
+	}()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	var total int64
+	for _, p := range positions {
+		if len(p) != 2 || p[0] <= 0 {
+			return fmt.Errorf("invalid rollback block metadata")
 		}
-
-		readByteCntTotal += int64(trxPoses[batchIdx][0])
-
-		bufStr = string(buf)
-		strArr := strings.Split(bufStr, LineSep)
-		var strArrStrs []string = make([]string, len(strArr))
-
-		for ji, ai := 0, len(strArr)-1; ai >= 0; ai-- {
-
-			if strArr[ai] == "" {
+		total += int64(p[0])
+	}
+	if total != info.Size() {
+		return fmt.Errorf("rollback metadata size %d != tmp size %d", total, info.Size())
+	}
+	out, err := open(dest)
+	if err != nil {
+		return fmt.Errorf("open rollback %s: %w", dest, err)
+	}
+	defer func() {
+		if err := out.Close(); result == nil && err != nil {
+			result = fmt.Errorf("close rollback %s: %w", dest, err)
+		}
+	}()
+	lastTrx := 0
+	for i := len(positions) - 1; i >= 0; i-- {
+		p := positions[i]
+		total -= int64(p[0])
+		buf := make([]byte, p[0])
+		if _, err := in.ReadAt(buf, total); err != nil {
+			return fmt.Errorf("read rollback tmp: %w", err)
+		}
+		if keepTrx && lastTrx != p[1] {
+			if err := writeOutput(out, "commit;\nbegin;\n"); err != nil {
+				return fmt.Errorf("write rollback transaction: %w", err)
+			}
+		}
+		lastTrx = p[1]
+		lines := strings.Split(string(buf), "\n")
+		for j := len(lines) - 1; j >= 0; j-- {
+			if lines[j] == "" {
 				continue
 			}
-			/*
-				if trxPoses[batchIdx][1] == 1 {
-					if strArr[ai] == "commit" {
-						ifCommit = true
-						if batchIdx == 0 && ai == 0 {
-							strArrStrs[ji] = "" // "commit" is written as the first line in the tmp file, so we skip it
-						} else {
-							strArrStrs[ji] = "begin"
-						}
-
-					} else if strArr[ai] == "rollback" {
-						ifCommit = false
-						strArrStrs[ji] = "begin"
-					} else if strArr[ai] == "begin" {
-						if ifCommit {
-							strArrStrs[ji] = "commit"
-						} else {
-							strArrStrs[ji] = "rollback"
-						}
-						ifCommit = true // default is commit
-					}
-				} else {
-					strArrStrs[ji] = strArr[ai]
-				}
-			*/
-			strArrStrs[ji] = strArr[ai]
-			ji++
-
-		}
-		if keepTrx && lastTrxIdx != trxPoses[batchIdx][1] {
-			destFH.WriteString("commit;\nbegin;\n")
-		}
-		lastTrxIdx = trxPoses[batchIdx][1]
-		_, err = destFH.WriteString(strings.Join(strArrStrs, LineSep))
-		if err != nil {
-			log.Errorf("fail to write file %s", destFile)
-			return err
-		}
-
-		if readByteCntTotal == srcSize || startPos == 0 {
-			break // finishing reading
-		}
-		if batchIdx > 0 {
-			_, err := srcFH.Seek(-int64(trxPoses[batchIdx][0]), os.SEEK_CUR)
-			if err != nil {
-				log.Errorf("fail to seek file %s", srcFile)
-				return err
+			if err := writeOutput(out, lines[j]+"\n"); err != nil {
+				return fmt.Errorf("write rollback %s: %w", dest, err)
 			}
 		}
 	}
-
 	if keepTrx {
-		destFH.WriteString("commit;\n")
+		if err := writeOutput(out, "commit;\n"); err != nil {
+			return fmt.Errorf("write rollback commit: %w", err)
+		}
 	}
-	log.Infof(fmt.Sprintf("finish reverting tmp file %s into %s", srcFile, destFile))
 	return nil
-
 }

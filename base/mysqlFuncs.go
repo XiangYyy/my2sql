@@ -5,6 +5,7 @@ import (
 	"fmt"
 	toolkits "my2sql/toolkits"
 	"strings"
+	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/juju/errors"
@@ -51,8 +52,10 @@ type TblInfoJson struct {
 }
 
 type TablesColumnsInfo struct {
-	//lock       *sync.RWMutex
-	tableInfos map[string]*TblInfoJson //{db.tb:TblInfoJson}}
+	lock       sync.RWMutex
+	loadMu     sync.Mutex
+	tableInfos map[string]*TblInfoJson // Published entries are immutable.
+	load       func(*ConfCmd, string, string) (*TblInfoJson, error)
 }
 
 type column struct {
@@ -104,22 +107,35 @@ func CreateMysqlCon(mysqlUrl string) (*sql.DB, error) {
 	return db, nil
 }
 
-func (this *TablesColumnsInfo) GetTbDefFromDb(cfg *ConfCmd, dbname string, tbname string) {
-	//get table columns from DB
-	var err error
-	if cfg.FromDB == nil {
-		sqlUrl := GetMysqlUrl(cfg)
-		cfg.FromDB, err = CreateMysqlCon(sqlUrl)
-		if err != nil {
-			log.Fatalf("fail to connect to mysql %v", err)
-		}
-	}
-
-	this.GetTableColumns(cfg.FromDB, dbname, tbname)
-	this.GetTableKeysInfo(cfg.FromDB, dbname, tbname)
+func (this *TablesColumnsInfo) GetTbDefFromDb(cfg *ConfCmd, dbname string, tbname string) error {
+	_, err := this.getTableInfo(cfg, dbname, tbname)
+	return err
 }
 
-func (this *TablesColumnsInfo) GetTableKeysInfo(db *sql.DB, dbName string, tbName string) error {
+// Columns and keys must be loaded together before publishing an immutable entry.
+func (this *TablesColumnsInfo) GetTableColumns(db *sql.DB, dbname, tbname string) error {
+	return this.GetTbDefFromDb(&ConfCmd{FromDB: db}, dbname, tbname)
+}
+
+func (this *TablesColumnsInfo) GetTableKeysInfo(db *sql.DB, dbname, tbname string) error {
+	return this.GetTbDefFromDb(&ConfCmd{FromDB: db}, dbname, tbname)
+}
+
+func loadTableInfo(cfg *ConfCmd, dbname, tbname string) (*TblInfoJson, error) {
+	if cfg == nil || cfg.FromDB == nil {
+		return nil, fmt.Errorf("no database connection for table %s.%s", dbname, tbname)
+	}
+	info := &TblInfoJson{Database: dbname, Table: tbname}
+	if err := readTableColumns(cfg.FromDB, dbname, tbname, info); err != nil {
+		return nil, err
+	}
+	if err := readTableKeys(cfg.FromDB, dbname, tbname, info); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+func readTableKeys(db *sql.DB, dbName string, tbName string, info *TblInfoJson) error {
 	var (
 		ok           bool
 		dbTbKeysInfo map[string]map[string]map[string]KeyInfo = map[string]map[string]map[string]KeyInfo{}
@@ -208,19 +224,12 @@ func (this *TablesColumnsInfo) GetTableKeysInfo(db *sql.DB, dbName string, tbNam
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	var isPrimay bool = false
-	tbKey := GetAbsTableName(dbName, tbName)
-	if len(this.tableInfos) < 1 {
-		this.tableInfos = map[string]*TblInfoJson{}
-	}
-	_, ok = this.tableInfos[tbKey]
-	if !ok {
-		this.tableInfos[tbKey] = &TblInfoJson{
-			Database: dbName, Table: tbName,
-			PrimaryKey: KeyInfo{}, UniqueKeys: []KeyInfo{}}
-	}
-	this.tableInfos[tbKey].PrimaryKey = KeyInfo{}
-	this.tableInfos[tbKey].UniqueKeys = []KeyInfo{}
+	info.PrimaryKey = KeyInfo{}
+	info.UniqueKeys = []KeyInfo{}
 	for kname, kcolumn := range dbTbKeysInfo[dbName][tbName] {
 		isPrimay = false
 		_, ok = primaryKeys[dbName]
@@ -234,15 +243,15 @@ func (this *TablesColumnsInfo) GetTableKeysInfo(db *sql.DB, dbName string, tbNam
 			}
 		}
 		if isPrimay {
-			this.tableInfos[tbKey].PrimaryKey = kcolumn
+			info.PrimaryKey = kcolumn
 		} else {
-			this.tableInfos[tbKey].UniqueKeys = append(this.tableInfos[tbKey].UniqueKeys, kcolumn)
+			info.UniqueKeys = append(info.UniqueKeys, kcolumn)
 		}
 	}
 	return nil
 }
 
-func (this *TablesColumnsInfo) GetTableColumns(db *sql.DB, dbname string, tbname string) error {
+func readTableColumns(db *sql.DB, dbname string, tbname string, info *TblInfoJson) error {
 	var (
 		dbTbFieldsInfo map[string][]FieldInfo = map[string][]FieldInfo{}
 	)
@@ -299,25 +308,54 @@ func (this *TablesColumnsInfo) GetTableColumns(db *sql.DB, dbname string, tbname
 		}
 		dbTbFieldsInfo[tbKey] = append(dbTbFieldsInfo[tbKey], FieldInfo{FieldName: string(data[0]), FieldType: GetFiledType(string(data[1])), IsUnsigned: IsUnsigned(string(data[1]))})
 	}
-	if len(this.tableInfos) < 1 {
-		this.tableInfos = map[string]*TblInfoJson{}
+	if err := rows.Err(); err != nil {
+		return err
 	}
-	this.tableInfos[tbKey] = &TblInfoJson{Database: dbname, Table: tbname, Columns: dbTbFieldsInfo[tbKey]}
+	info.Columns = dbTbFieldsInfo[tbKey]
+	if len(info.Columns) == 0 {
+		return fmt.Errorf("table struct not found for %s", tbKey)
+	}
 	return nil
-
 }
 
 func (this *TablesColumnsInfo) GetTableInfoJson(schema string, table string) (*TblInfoJson, error) {
-	tbKey := GetAbsTableName(schema, table)
-	tbDefsJson, ok := this.tableInfos[tbKey]
-	if !ok {
-		this.GetTbDefFromDb(GConfCmd, schema, table)
-		tbDefsJson, ok = this.tableInfos[tbKey]
-		if !ok {
-			return &TblInfoJson{}, fmt.Errorf("table struct not found for %s, maybe it was dropped. Skip it", tbKey)
-		}
+	return this.getTableInfo(GConfCmd, schema, table)
+}
+
+func (this *TablesColumnsInfo) getTableInfo(cfg *ConfCmd, schema, table string) (*TblInfoJson, error) {
+	key := GetAbsTableName(schema, table)
+	lookup := func() *TblInfoJson {
+		this.lock.RLock()
+		defer this.lock.RUnlock()
+		return this.tableInfos[key]
 	}
-	return tbDefsJson, nil
+	if info := lookup(); info != nil {
+		return info, nil
+	}
+	// Serialize cache misses without holding the map lock during I/O.
+	this.loadMu.Lock()
+	defer this.loadMu.Unlock()
+	if info := lookup(); info != nil {
+		return info, nil
+	}
+	loader := this.load
+	if loader == nil {
+		loader = loadTableInfo
+	}
+	info, err := loader(cfg, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	if info == nil || len(info.Columns) == 0 {
+		return nil, fmt.Errorf("empty table structure for %s", key)
+	}
+	this.lock.Lock()
+	if this.tableInfos == nil {
+		this.tableInfos = make(map[string]*TblInfoJson)
+	}
+	this.tableInfos[key] = info
+	this.lock.Unlock()
+	return info, nil
 }
 
 func (this *TblInfoJson) GetOneUniqueKey(uniqueFirst bool) KeyInfo {

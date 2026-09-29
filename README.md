@@ -44,7 +44,7 @@ repl: 伪装成从库解析binlog文件，file: 离线解析binlog文件, 默认
 ```
 -local-binlog-file
 ```
-当指定-mode=file 参数时，需要指定-local-binlog-file binlog文件相对路径或绝对路径,可以连续解析多个binlog文件，只需要指定起始文件名，程序会自动持续解析下个文件
+当指定-mode=file 参数时，需要指定-local-binlog-file binlog文件相对路径或绝对路径；默认解析至当前文件末尾，指定时间条件或显式结束文件时可连续解析后续文件。
 ```
 
 -add-extraInfo
@@ -112,7 +112,7 @@ default false, this is, use changed columns to build set part, use primary/uniqu
 
 -work-type
 ```
-2sql：生成原始sql，rollback：生成回滚sql，stats：只统计DML、事务信息
+2sql：生成原始sql，rollback：生成回滚sql，stats：只统计DML、事务信息，binlogs：独立查询远程 MySQL binlog 文件及估算时间
 ```
 
 
@@ -130,6 +130,50 @@ default false, this is, use changed columns to build set part, use primary/uniqu
 
 
 # 使用案例
+### 查询远程 MySQL binlog 文件和时间范围
+新功能仅适用于 `-mode repl -mysql-type mysql`，需要重新编译当前源码；仓库内预编译二进制不会自动更新。
+
+```sh
+# 列出全部保留文件，并显示最早保留文件、最早探测可读文件；省略密码时交互输入
+./my2sql -host 127.0.0.1 -user reader -work-type binlogs
+
+# 按时间查找候选文件；也可只传开始时间或结束时间
+./my2sql -host 127.0.0.1 -user reader -work-type binlogs -start-datetime "2026-09-01 10:00:00" -stop-datetime "2026-09-01 11:00:00" -tl Asia/Shanghai
+```
+
+- 表格列为 `File / SizeBytes / SampleStartTime / EstimatedEndTime / Status`。样本开始时间取文件开头首个时间戳非零的业务事件，估算结束时间取下一文件样本；末文件显示 `unknown/open`，不是当前时间。
+- 状态包括 `sampled`（已获得样本）、`header-only`（探测范围内仅有控制事件）、`unknown`（业务时间未知）、`probe-limit`（达到事件上限）、`error`（失败，附原因）。
+- “最早探测可读”只表示保留且复制读取/文件头解析成功，不保证历史表结构齐全或一定能生成回滚 SQL。
+- 查询只输出到终端，不生成 SQL、统计文件，不启动 SQL worker、不读取表结构；即使传 `-output-dir` 也不会创建目录或截断已有文件。表格写 stdout，诊断和密码提示写 stderr。
+- 查询不接受文件/Pos 参数，包括显式 `-start-pos 4`，请使用时间条件。探测失败保留错误行，退出状态非零，表示查询结果不完整。
+
+### 纯时间解析自动定位
+`-auto-position` 默认开启：远程 MySQL 的 `2sql`、`rollback`、`stats` 只传时间条件、未显式指定文件/Pos 时，先展示探测候选范围，正式解析仍从最早保留文件 Pos 4 扫描到入口处的源快照，不用样本时间排除文件。
+
+```sh
+./my2sql -host 127.0.0.1 -user reader -work-type 2sql -start-datetime "2026-09-01 10:00:00" -stop-datetime "2026-09-01 11:00:00" -tl Asia/Shanghai -output-dir ./tmpdir
+
+# 跳过候选探测，仍从最早保留文件扫描至固定的物理上界
+./my2sql -host 127.0.0.1 -user reader -work-type 2sql -start-datetime "2026-09-01 10:00:00" -stop-datetime "2026-09-01 11:00:00" -tl Asia/Shanghai -auto-position=false -output-dir ./tmpdir
+```
+
+- 时间区间为 `[start-datetime, stop-datetime)`，输入和查询展示统一使用 `-tl`。显式文件/Pos 优先，不被自动定位覆盖；本地文件和 MariaDB 不自动定位。
+- 每个文件串行从 Pos 4 短暂探测，使用 raw 模式，不解析行数据；单文件最多消费 64 个事件、超时 5 秒，忽略 ROTATE、FORMAT_DESCRIPTION、GTID、PREVIOUS_GTIDS、HEARTBEAT 等控制事件。依赖存在异步预读，不保证只传事件头或严格限制网络字节数。
+- 目录探测成本为 O(文件数) 次短探测；展示的相交候选前后各保留一个相邻文件，同秒样本组不拆分。正式解析会扫描实际物理范围内的所有事件，其成本不受短探测上限约束。
+- 出现未知时间、探测失败或样本倒序时，告警并将候选退回全部保留文件。时间早于最早样本可能意味着更早日志已清理；晚于最新样本不代表没有记录。PURGE 导致目录变化时最多刷新重试一次，连续变化时报错。
+- 正式远程解析在未指定物理终点时固定入口处的源库 binlog 文件/位点快照；纯时间请求从最早保留文件开始，候选范围不用于裁剪扫描范围。未到达物理上界的读取空闲超时属于失败，不持续订阅未来日志。
+- 样本/估算不是精确首末时间，仅供目录查询参考，不能排除未采样的时间乱序。`-auto-position=false` 可跳过候选探测；显式指定文件/Pos 才能缩小物理扫描范围，该范围之外或已清理的事件不在覆盖保证内。
+- 查询需要 `REPLICATION CLIENT`、`REPLICATION SLAVE`（或服务端对应的复制权限）；生成 SQL 仍需表结构读取权限。`-server-id` 必须是非零 uint32 且在复制拓扑中唯一；探测与正式复制不会同时使用同一 ID。不执行轮转、清理或配置变更。
+
+### 解析边界与失败处理
+- 时间条件为事件头时间的 `[start-datetime, stop-datetime)`，区间外事件只被过滤，不因先遇到较晚时间戳而终止扫描；不保证事务完整，也不重建历史表结构。
+- `stop-pos` 表示真实事件的结束位点，包含结束于该位点且满足筛选条件的事件，处理后立即停止，无需传 `P+1`。即使末事件被筛选掉也会终止；心跳和伪造的复制控制事件不能证明到达边界。越过非事件末尾的停止位点会报错，不静默截断。
+- 远程解析未指定物理终点时固定源库当前快照；本地文件解析默认以文件大小为上界，纯时间模式可包含连续的后续本地文件。到达上界前发生超时、提前 EOF、范围内文件缺失或解析错误均非零退出。
+- 本地解析指定下一文件 Pos 4（例如 `-stop-file mysql-bin.000002 -stop-pos 4`）表示在该文件开始前停止；不会打开或读取该终点文件，也不要求它存在。范围内的中间文件缺失或事件截断仍会失败。
+- 探测和正式复制均禁用自动重连，避免当前复制依赖在关闭与重连并发时互相等待。正式复制断连且未到物理终点时按不完整结果报错退出，需要人工重新运行；已有部分结果不能当作完整产物，重跑请使用独立输出目录，避免覆盖或混用。目录因 PURGE 变化时的一次刷新重试不受影响。
+- SQL、统计文件的打开、写入、刷新、关闭以及回滚逆序错误参与最终退出状态；失败时停止生成有效输出并排空内部通道，不能把部分文件当作成功产物。逆序失败保留对应临时源文件，只有全部阶段成功才输出完成标记。
+- 列数不匹配会失败；列数相同的历史列重排等情况仍不能可靠识别，必须使用匹配的历史结构并在隔离库验证结果。
+
 ### 解析出标准SQL
 #### 根据时间点解析出标准SQL
 ```
@@ -183,7 +227,7 @@ default false, this is, use changed columns to build set part, use primary/uniqu
 ```
 
 
-### 从某一个pos点解析出标准SQL，并且持续打印到屏幕
+### 从某一个pos点解析到入口处源快照，并打印到屏幕
 ```
 #伪装成从库解析binlog
 ./my2sql  -user root -password xxxx -host 127.0.0.1   -port 3306 -mode repl  -work-type 2sql  -start-file mysql-bin.011259  -start-pos 4   -output-toScreen 
