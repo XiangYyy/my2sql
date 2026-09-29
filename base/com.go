@@ -6,11 +6,12 @@ import (
 	"strconv"
 	"sync"
 
+	"my2sql/dsql"
+	toolkits "my2sql/toolkits"
+
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/google/uuid"
-	"my2sql/dsql"
-	toolkits "my2sql/toolkits"
 )
 
 type BinEventHandlingIndx struct {

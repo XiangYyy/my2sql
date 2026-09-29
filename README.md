@@ -57,7 +57,7 @@ UPDATE `orchestrator`.`cluster_domain_name` SET `last_registered`='2020-07-16 10
 ```
 其中：
 - `trxindex`：本次解析内的事务序号，遇 BEGIN 从 1 递增，可用于识别哪些 SQL 属于同一事务；序号只在本次解析内有意义，且解析起点落在事务中间时首个不完整事务为 0
-- `gtid`：binlog 中记录的真实事务 id（`uuid:gno`）；`gtid_mode=OFF`（匿名事务）或解析起点位于事务中间时为空
+- `gtid`：binlog 中记录的真实事务 id（`uuid:gno`）；`gtid_mode=OFF`（匿名事务）时为空。模式差异：远程解析（`-mode=repl`）起点落在事务中间时，因该位置之前的事务头事件不再下发，首个不完整事务的 gtid 为空；本地解析（`-mode=file`）从文件头 Pos 4 读取并在过滤前维护 GTID 上下文，故即使起点落在事务中间，保留的行事件仍带上其真实 gtid。
 
 -big-trx-row-limit n
 

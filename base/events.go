@@ -10,10 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/siddontang/go-log/log"
 	"my2sql/constvar"
 	SQL "my2sql/sqlbuilder"
 	"my2sql/sqltypes"
+
+	"github.com/siddontang/go-log/log"
 )
 
 type ExtraSqlInfoOfPrint struct {
