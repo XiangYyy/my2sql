@@ -49,12 +49,16 @@ repl: 伪装成从库解析binlog文件，file: 离线解析binlog文件, 默认
 
 -add-extraInfo
 ```
-是否把database/table/datetime/binlogposition...信息以注释的方式加入生成的每条sql前，默认false
+是否把database/table/datetime/binlogposition/事务标识信息以注释的方式加入生成的每条sql前，仅 -work-type=2sql|rollback 有效，默认false
 ```
 ```
-# datetime=2020-07-16_10:44:09 database=orchestrator table=cluster_domain_name binlog=mysql-bin.011519 startpos=15552 stoppos=15773
+# datetime=2020-07-16_10:44:09 database=orchestrator table=cluster_domain_name binlog=mysql-bin.011519 startpos=15552 stoppos=15773 trxindex=3 gtid=3e11fa47-71ca-11e1-9e33-c80aa9429562:23
 UPDATE `orchestrator`.`cluster_domain_name` SET `last_registered`='2020-07-16 10:44:09' WHERE `cluster_name`='192.168.1.1:3306'
 ```
+其中：
+- `trxindex`：本次解析内的事务序号，遇 BEGIN 从 1 递增，可用于识别哪些 SQL 属于同一事务；序号只在本次解析内有意义，且解析起点落在事务中间时首个不完整事务为 0
+- `gtid`：binlog 中记录的真实事务 id（`uuid:gno`）；`gtid_mode=OFF`（匿名事务）或解析起点位于事务中间时为空
+
 -big-trx-row-limit n
 
 ```
@@ -169,7 +173,7 @@ default false, this is, use changed columns to build set part, use primary/uniqu
 - 时间条件为事件头时间的 `[start-datetime, stop-datetime)`，区间外事件只被过滤，不因先遇到较晚时间戳而终止扫描；不保证事务完整，也不重建历史表结构。
 - `stop-pos` 表示真实事件的结束位点，包含结束于该位点且满足筛选条件的事件，处理后立即停止，无需传 `P+1`。即使末事件被筛选掉也会终止；心跳和伪造的复制控制事件不能证明到达边界。越过非事件末尾的停止位点会报错，不静默截断。
 - 远程解析未指定物理终点时固定源库当前快照；本地文件解析默认以文件大小为上界，纯时间模式可包含连续的后续本地文件。到达上界前发生超时、提前 EOF、范围内文件缺失或解析错误均非零退出。
-- 本地解析指定下一文件 Pos 4（例如 `-stop-file mysql-bin.000002 -stop-pos 4`）表示在该文件开始前停止；不会打开或读取该终点文件，也不要求它存在。范围内的中间文件缺失或事件截断仍会失败。
+- 本地解析指定下一文件 Pos 4（例如 `-stop-file mysql-bin.000002 -stop-pos 4`）表示在该文件开始前停止；不会打开或读取该终点文件，也不要求它存在；该排除只作用于终点文件，起始文件仍会被打开校验。范围内的中间文件缺失或事件截断仍会失败。
 - 探测和正式复制均禁用自动重连，避免当前复制依赖在关闭与重连并发时互相等待。正式复制断连且未到物理终点时按不完整结果报错退出，需要人工重新运行；已有部分结果不能当作完整产物，重跑请使用独立输出目录，避免覆盖或混用。目录因 PURGE 变化时的一次刷新重试不受影响。
 - SQL、统计文件的打开、写入、刷新、关闭以及回滚逆序错误参与最终退出状态；失败时停止生成有效输出并排空内部通道，不能把部分文件当作成功产物。逆序失败保留对应临时源文件，只有全部阶段成功才输出完成标记。
 - 列数不匹配会失败；列数相同的历史列重排等情况仍不能可靠识别，必须使用匹配的历史结构并在隔离库验证结果。

@@ -246,7 +246,7 @@ func TestLocalExclusiveFileStartBoundary(t *testing.T) {
 		{name: "inclusive-event-end", stopFile: "mysql-bin.000001", stopPos: 31, wantStats: 1},
 		{name: "inside-event", stopFile: "mysql-bin.000001", stopPos: 30, wantError: true},
 		{name: "past-file", stopFile: "mysql-bin.000000", stopPos: 4, wantError: true},
-		{name: "empty-range", stopFile: "mysql-bin.000001", stopPos: 4},
+		{name: "empty-range", stopFile: "mysql-bin.000001", stopPos: 4, wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -306,7 +306,7 @@ func TestLocalSnapshotAndTruncatedFiles(t *testing.T) {
 	if err := os.WriteFile(name, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"snapshot", "missing-next", "truncated", "bad-header"} {
+	for _, mode := range []string{"snapshot", "missing-next", "truncated", "bad-header", "magic-only"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := boundedConfig(31)
 			cfg.Mode = "file"
@@ -314,6 +314,12 @@ func TestLocalSnapshotAndTruncatedFiles(t *testing.T) {
 			switch mode {
 			case "snapshot":
 				cfg.IfSetStopFilePos = false
+			case "magic-only":
+				// 仅含 4 字节 magic 的残缺文件不能静默成功。
+				cfg.IfSetStopFilePos = false
+				if err := os.WriteFile(name, replication.BinLogFileHeader, 0600); err != nil {
+					t.Fatal(err)
+				}
 			case "missing-next":
 				cfg.StopFilePos = mysql.Position{Name: "mysql-bin.000002", Pos: 31}
 			case "truncated":

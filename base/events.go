@@ -22,6 +22,7 @@ type ExtraSqlInfoOfPrint struct {
 	datetime              string
 	trxIndex              uint64
 	trxStatus             int
+	gtid                  string
 }
 
 type ForwardRollbackSqlOfPrint struct {
@@ -189,6 +190,7 @@ func generateSQL(cfg *ConfCmd, ev MyBinEvent) (sc ForwardRollbackSqlOfPrint, err
 	return ForwardRollbackSqlOfPrint{sqls: sqlArr, sqlInfo: ExtraSqlInfoOfPrint{
 		schema: db, table: tb, binlog: ev.MyPos.Name, startpos: ev.StartPos, endpos: ev.MyPos.Pos,
 		datetime: GetDatetimeStr(int64(ev.Timestamp), 0, constvar.DATETIME_FORMAT_NOSPACE), trxIndex: ev.TrxIndex, trxStatus: ev.TrxStatus,
+		gtid: ev.Gtid,
 	}}, nil
 }
 
@@ -272,8 +274,9 @@ func GetForwardRollbackSqlFileName(schema, table string, filePerTable bool, outD
 
 func GetForwardRollbackContentLineWithExtra(sq ForwardRollbackSqlOfPrint, ifExtra bool) string {
 	if ifExtra {
-		return fmt.Sprintf("# datetime=%s database=%s table=%s binlog=%s startpos=%d stoppos=%d\n%s;\n",
-			sq.sqlInfo.datetime, sq.sqlInfo.schema, sq.sqlInfo.table, sq.sqlInfo.binlog, sq.sqlInfo.startpos, sq.sqlInfo.endpos, strings.Join(sq.sqls, ";\n"))
+		return fmt.Sprintf("# datetime=%s database=%s table=%s binlog=%s startpos=%d stoppos=%d trxindex=%d gtid=%s\n%s;\n",
+			sq.sqlInfo.datetime, sq.sqlInfo.schema, sq.sqlInfo.table, sq.sqlInfo.binlog, sq.sqlInfo.startpos, sq.sqlInfo.endpos,
+			sq.sqlInfo.trxIndex, sq.sqlInfo.gtid, strings.Join(sq.sqls, ";\n"))
 	}
 	return strings.Join(sq.sqls, ";\n") + ";\n"
 }

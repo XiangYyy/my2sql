@@ -58,6 +58,7 @@ func sendBinlogEvents(cfg *ConfCmd, stream binlogEventReader) error {
 		trxIndex      uint64 = 0
 		trxStatus     int    = 0
 		sqlLower      string = ""
+		currentGTID   string = ""
 
 		db      string = ""
 		tb      string = ""
@@ -109,6 +110,10 @@ func sendBinlogEvents(cfg *ConfCmd, stream binlogEventReader) error {
 		if ev.Header.EventType == replication.TABLE_MAP_EVENT {
 			tbMapPos = ev.Header.LogPos - ev.Header.EventSize
 			// avoid mysqlbing mask the row event as unknown table row event
+		}
+		// 事务组开始事件总是更新 GTID 上下文，即使事件本身被后续过滤跳过。
+		if startsGtidTrxGroup(ev.Header.EventType) {
+			currentGTID = formatBinlogGtid(ev)
 		}
 		ev.RawData = []byte{} // we donnot need raw data
 
@@ -175,6 +180,7 @@ func sendBinlogEvents(cfg *ConfCmd, stream binlogEventReader) error {
 				oneMyEvent.Timestamp = ev.Header.Timestamp
 				oneMyEvent.TrxIndex = trxIndex
 				oneMyEvent.TrxStatus = trxStatus
+				oneMyEvent.Gtid = currentGTID
 				cfg.EventChan <- *oneMyEvent
 			}
 		}

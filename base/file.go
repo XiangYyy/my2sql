@@ -70,11 +70,12 @@ func (p BinFileParser) MyParseAllBinlogFiles(cfg *ConfCmd) (result error) {
 		return err
 	}
 	base, idx := GetBinlogBasenameAndIndex(binlog)
+	opened := false
 	for {
 		fileStart := mysql.Position{Name: filepath.Base(binlog), Pos: 4}
 		cmp := fileStart.Compare(cfg.StopFilePos)
-		// 文件起点是排他终点，不必打开范围外的文件。
-		if cmp == 0 {
+		// 排他终点只跳过后继文件；起始文件仍需打开并校验。
+		if cmp == 0 && opened {
 			return nil
 		}
 		if cmp > 0 {
@@ -84,6 +85,7 @@ func (p BinFileParser) MyParseAllBinlogFiles(cfg *ConfCmd) (result error) {
 		if err != nil {
 			return err
 		}
+		opened = true
 		if result == C_reBreak {
 			return nil
 		}
@@ -120,6 +122,7 @@ func (p BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, binlog *string) 
 	var tbMapPos uint32
 	var offset uint64 = 4 // Readers start immediately after the binlog magic.
 	trxStatus := 0
+	currentGTID := ""
 	stopAfter := false
 	for !stopAfter {
 		if err := cfg.Err(); err != nil {
@@ -160,6 +163,10 @@ func (p BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, binlog *string) 
 			tbMapPos = h.LogPos - h.EventSize
 		}
 		event := &replication.BinlogEvent{Header: h, Event: e}
+		// 事务组开始事件总是更新 GTID 上下文，即使事件本身被后续过滤跳过。
+		if startsGtidTrxGroup(h.EventType) {
+			currentGTID = formatBinlogGtid(event)
+		}
 		one := &MyBinEvent{MyPos: mysql.Position{Name: *binlog, Pos: h.LogPos}, StartPos: tbMapPos}
 		// ROTATE must not relabel bytes that still belong to the currently opened file.
 		current := *binlog
@@ -196,6 +203,7 @@ func (p BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, binlog *string) 
 			fileBinEventHandlingIndex++
 			one.EventIdx, one.SqlType, one.Timestamp = fileBinEventHandlingIndex, sqlType, h.Timestamp
 			one.TrxIndex, one.TrxStatus = fileTrxIndex, trxStatus
+			one.Gtid = currentGTID
 			cfg.EventChan <- *one
 		}
 		if sqlType != "" {

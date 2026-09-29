@@ -1,11 +1,14 @@
 package base
 
 import (
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/google/uuid"
 	"my2sql/dsql"
 	toolkits "my2sql/toolkits"
 )
@@ -30,8 +33,41 @@ type MyBinEvent struct {
 	Timestamp   uint32
 	TrxIndex    uint64
 	TrxStatus   int           // 0:begin, 1: commit, 2: rollback, -1: in_progress
+	Gtid        string        // 事务组 GTID，MySQL 为 uuid:gno，匿名事务（gtid_mode=OFF）为空
 	QuerySql    *dsql.SqlInfo // for ddl and binlog which is not row format
 	OrgSql      string        // for ddl and binlog which is not row format
+}
+
+// startsGtidTrxGroup 报告事件是否开启一个新事务组（GTID/ANONYMOUS/MariaDB GTID 事件）。
+func startsGtidTrxGroup(t replication.EventType) bool {
+	switch t {
+	case replication.GTID_EVENT, replication.ANONYMOUS_GTID_EVENT, replication.MARIADB_GTID_EVENT:
+		return true
+	}
+	return false
+}
+
+// formatBinlogGtid 返回事件所属事务组的 GTID；匿名事务（gtid_mode=OFF，GNO 为 0）返回空。
+func formatBinlogGtid(ev *replication.BinlogEvent) string {
+	switch ev.Header.EventType {
+	case replication.GTID_EVENT, replication.ANONYMOUS_GTID_EVENT:
+		e, ok := ev.Event.(*replication.GTIDEvent)
+		if !ok || e.GNO == 0 || len(e.SID) != 16 {
+			return ""
+		}
+		sid, err := uuid.FromBytes(e.SID)
+		if err != nil {
+			return ""
+		}
+		return sid.String() + ":" + strconv.FormatInt(e.GNO, 10)
+	case replication.MARIADB_GTID_EVENT:
+		e, ok := ev.Event.(*replication.MariadbGTIDEvent)
+		if !ok {
+			return ""
+		}
+		return fmt.Sprintf("%d-%d-%d", e.GTID.DomainID, e.GTID.ServerID, e.GTID.SequenceNumber)
+	}
+	return ""
 }
 
 // ReachedAutoStop 使用下一文件的排他边界，不以候选末文件的末事件位置停止。
