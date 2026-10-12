@@ -16,6 +16,9 @@ import (
 
 const binlogProbeEventLimit = 64
 
+// autoNarrowMargin 是窄窗口快速模式在候选窗口两侧保留的物理文件余量。
+const autoNarrowMargin = 2
+
 // BinlogInfo 中的时间是文件头部业务事件的样本，不是文件的精确最小时间。
 type BinlogInfo struct {
 	Name       string
@@ -219,6 +222,8 @@ type BinlogSelection struct {
 	Last       int
 	StopBefore string
 	Warnings   []string
+	// WindowKnown 为 false 时候选窗口不可靠，调用方必须保守保留全部文件。
+	WindowKnown bool
 }
 
 func SelectBinlogs(files []BinlogInfo, cfg *ConfCmd) BinlogSelection {
@@ -259,6 +264,7 @@ func SelectBinlogs(files []BinlogInfo, cfg *ConfCmd) BinlogSelection {
 		s.Warnings = append(s.Warnings, "无法界定时间交集，保守保留全部文件")
 		return s
 	}
+	s.WindowKnown = true
 	if first > 0 {
 		first--
 	}
@@ -316,6 +322,29 @@ func DiscoverBinlogs(ctx context.Context, cfg *ConfCmd, source BinlogSource, out
 	if len(files) == 0 {
 		fmt.Fprintln(diagnostics, "无可用 binlog 文件")
 		return false, nil
+	}
+	if cfg.NarrowWindow {
+		if s.WindowKnown {
+			start := s.First - autoNarrowMargin
+			if start < 0 {
+				start = 0
+			}
+			cfg.StartFile, cfg.StartPos = files[start].Name, 4
+			cfg.StartFilePos = mysql.Position{Name: cfg.StartFile, Pos: 4}
+			cfg.IfSetStartFilePos = true
+			cfg.AutoStopBeforeFile = ""
+			stop := s.Last + 1 + autoNarrowMargin
+			if stop < len(files) {
+				cfg.StopFile, cfg.StopPos = files[stop].Name, 4
+				cfg.StopFilePos = mysql.Position{Name: cfg.StopFile, Pos: 4}
+				cfg.IfSetStopFilePos = true
+				fmt.Fprintf(diagnostics, "快速模式（narrow）：候选 %s 至 %s，前后各留最多 %d 个文件余量；解析 %s:4 至 %s:4（排他）；时间条件仍逐事件过滤，该范围之外的乱序事件不在覆盖内。\n", files[s.First].Name, files[s.Last].Name, autoNarrowMargin, cfg.StartFile, cfg.StopFile)
+			} else {
+				fmt.Fprintf(diagnostics, "快速模式（narrow）：候选 %s 至 %s，起点前留最多 %d 个文件余量；解析 %s:4 至入口处源快照；时间条件仍逐事件过滤，该范围之外的乱序事件不在覆盖内。\n", files[s.First].Name, files[s.Last].Name, autoNarrowMargin, cfg.StartFile)
+			}
+			return true, nil
+		}
+		fmt.Fprintln(diagnostics, "快速模式（narrow）无法生效：候选窗口不可靠（未知时间、探测失败或样本倒序），已回退保守全量定位。")
 	}
 	// Sample times cannot safely exclude files with non-monotonic event timestamps.
 	cfg.StartFile, cfg.StartPos = files[0].Name, 4

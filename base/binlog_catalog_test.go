@@ -39,18 +39,19 @@ func TestSelectBinlogs(t *testing.T) {
 		start, stop uint32
 		first, last int
 		warning     bool
+		window      bool
 	}{
-		{"全部", 0, 0, 0, 6, false},
-		{"中间范围", 350, 450, 1, 4, false},
-		{"相等边界", 300, 400, 0, 4, false},
-		{"仅开始", 350, 0, 1, 6, false},
-		{"仅结束", 0, 350, 0, 3, false},
-		{"早于保留", 1, 50, 0, 1, true},
-		{"晚于最新", 800, 900, 5, 6, true},
+		{"全部", 0, 0, 0, 6, false, false},
+		{"中间范围", 350, 450, 1, 4, false, true},
+		{"相等边界", 300, 400, 0, 4, false, true},
+		{"仅开始", 350, 0, 1, 6, false, true},
+		{"仅结束", 0, 350, 0, 3, false, true},
+		{"早于保留", 1, 50, 0, 1, true, true},
+		{"晚于最新", 800, 900, 5, 6, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := SelectBinlogs(files, timeRange(tc.start, tc.stop))
-			if s.First != tc.first || s.Last != tc.last || (len(s.Warnings) > 0) != tc.warning {
+			if s.First != tc.first || s.Last != tc.last || s.WindowKnown != tc.window || (len(s.Warnings) > 0) != tc.warning {
 				t.Fatalf("候选范围错误: %+v", s)
 			}
 			wantStop := ""
@@ -62,14 +63,14 @@ func TestSelectBinlogs(t *testing.T) {
 			}
 		})
 	}
-	if s := SelectBinlogs(nil, timeRange(10, 20)); s.Last != -1 || s.StopBefore != "" {
+	if s := SelectBinlogs(nil, timeRange(10, 20)); s.Last != -1 || s.StopBefore != "" || s.WindowKnown {
 		t.Fatalf("空目录: %+v", s)
 	}
-	if s := SelectBinlogs(sampleCatalog(100), timeRange(200, 300)); s.First != 0 || s.Last != 0 || s.StopBefore != "" {
+	if s := SelectBinlogs(sampleCatalog(100), timeRange(200, 300)); s.First != 0 || s.Last != 0 || s.StopBefore != "" || !s.WindowKnown {
 		t.Fatalf("单文件: %+v", s)
 	}
 	s := SelectBinlogs(sampleCatalog(100, 200, 200, 200, 300, 400, 400, 400, 500, 600), timeRange(320, 330))
-	if s.First != 1 || s.Last != 7 {
+	if s.First != 1 || s.Last != 7 || !s.WindowKnown {
 		t.Fatalf("同秒组被拆分: %+v", s)
 	}
 }
@@ -84,9 +85,13 @@ func TestSelectBinlogsFallback(t *testing.T) {
 		files := sampleCatalog(100, 200, 300, 400, 500, 600)
 		change(files)
 		s := SelectBinlogs(files, timeRange(310, 320))
-		if s.First != 0 || s.Last != 5 || s.StopBefore != "" || len(s.Warnings) == 0 {
+		if s.First != 0 || s.Last != 5 || s.StopBefore != "" || s.WindowKnown || len(s.Warnings) == 0 {
 			t.Fatalf("未保守回退: %+v", s)
 		}
+	}
+	files := sampleCatalog(100, 200, 300, 400, 500, 600, 700)
+	if s := SelectBinlogs(files, timeRange(310, 250)); s.First != 0 || s.Last != len(files)-1 || s.WindowKnown || len(s.Warnings) == 0 {
+		t.Fatalf("无交集未保守回退: %+v", s)
 	}
 }
 
@@ -327,6 +332,74 @@ func TestDiscoverBinlogs(t *testing.T) {
 	if !proceed || err != nil || cfg.StartFile != "" {
 		t.Fatal("显式 Pos 被自动覆盖")
 	}
+}
+
+func TestDiscoverBinlogsNarrow(t *testing.T) {
+	files := sampleCatalog(100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200)
+	t.Run("中部窗口", func(t *testing.T) {
+		cfg := timeRange(650, 750)
+		cfg.NarrowWindow = true
+		var out, diagnostics bytes.Buffer
+		proceed, err := DiscoverBinlogs(context.Background(), cfg, &testBinlogSource{lists: [][]BinlogInfo{files}}, &out, &diagnostics)
+		if err != nil || !proceed {
+			t.Fatalf("快速模式失败: %v", err)
+		}
+		start, stop := files[2], files[10]
+		if cfg.StartFile != start.Name || cfg.StartPos != 4 || !cfg.IfSetStartFilePos || cfg.StartFilePos != (mysql.Position{Name: start.Name, Pos: 4}) {
+			t.Fatalf("起点未按余量裁剪: %+v", cfg)
+		}
+		if cfg.StopFile != stop.Name || cfg.StopPos != 4 || !cfg.IfSetStopFilePos || cfg.StopFilePos != (mysql.Position{Name: stop.Name, Pos: 4}) || cfg.AutoStopBeforeFile != "" {
+			t.Fatalf("排他终点未按余量裁剪: %+v", cfg)
+		}
+		if out.Len() != 0 || !strings.Contains(diagnostics.String(), "快速模式（narrow）") || !strings.Contains(diagnostics.String(), start.Name) || !strings.Contains(diagnostics.String(), stop.Name) || strings.Contains(diagnostics.String(), "启发式") {
+			t.Fatalf("缺少快速模式诊断: %s", diagnostics.String())
+		}
+	})
+	t.Run("起点钳到最早保留文件", func(t *testing.T) {
+		cfg := timeRange(150, 250)
+		cfg.NarrowWindow = true
+		var diagnostics bytes.Buffer
+		proceed, err := DiscoverBinlogs(context.Background(), cfg, &testBinlogSource{lists: [][]BinlogInfo{files}}, io.Discard, &diagnostics)
+		if err != nil || !proceed {
+			t.Fatalf("起点钳制失败: %v", err)
+		}
+		if cfg.StartFile != files[0].Name || cfg.StopFile != files[5].Name || !cfg.IfSetStopFilePos {
+			t.Fatalf("起点应钳到最早保留文件，终点为 files[5]: %+v", cfg)
+		}
+		if !strings.Contains(diagnostics.String(), "前后各留最多 2 个文件余量") {
+			t.Fatalf("余量文案不符: %s", diagnostics.String())
+		}
+	})
+	t.Run("尾部窗口", func(t *testing.T) {
+		cfg := timeRange(950, 1050)
+		cfg.NarrowWindow = true
+		var diagnostics bytes.Buffer
+		proceed, err := DiscoverBinlogs(context.Background(), cfg, &testBinlogSource{lists: [][]BinlogInfo{files}}, io.Discard, &diagnostics)
+		if err != nil || !proceed {
+			t.Fatalf("尾部快速模式失败: %v", err)
+		}
+		if cfg.StartFile != files[5].Name || cfg.IfSetStopFilePos || cfg.StopFile != "" || cfg.StopFilePos != (mysql.Position{}) {
+			t.Fatalf("尾部窗口应省略终点: %+v", cfg)
+		}
+		if !strings.Contains(diagnostics.String(), "源快照") {
+			t.Fatalf("缺少快照终点提示: %s", diagnostics.String())
+		}
+	})
+	t.Run("窗口不可靠回退", func(t *testing.T) {
+		cfg := timeRange(650, 750)
+		cfg.NarrowWindow = true
+		broken := append([]BinlogInfo(nil), files...)
+		broken[3].ProbeError = errors.New("无复制权限")
+		broken[3].Status = "error"
+		var diagnostics bytes.Buffer
+		proceed, err := DiscoverBinlogs(context.Background(), cfg, &testBinlogSource{lists: [][]BinlogInfo{broken}}, io.Discard, &diagnostics)
+		if err != nil || !proceed {
+			t.Fatalf("降级失败: %v", err)
+		}
+		if cfg.StartFile != broken[0].Name || cfg.IfSetStopFilePos || cfg.StopFile != "" || !strings.Contains(diagnostics.String(), "已回退保守全量定位") || !strings.Contains(diagnostics.String(), "启发式") {
+			t.Fatalf("未降级为保守定位: %+v, %s", cfg, diagnostics.String())
+		}
+	})
 }
 
 type failedWriter struct{}

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -62,23 +63,25 @@ func TestQueryDoesNotInitializeOutput(t *testing.T) {
 
 func TestAutoPositionOptions(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		args           []string
-		auto, explicit bool
+		name                   string
+		args                   []string
+		auto, explicit, narrow bool
 	}{
-		{"默认开启", nil, true, false},
-		{"显式默认起点", []string{"-start-pos=4"}, false, true},
-		{"显式默认终点", []string{"-stop-pos=4"}, false, true},
-		{"显式空文件", []string{"-start-file="}, false, true},
-		{"指定起始文件", []string{"-start-file=mysql-bin.000001"}, false, true},
-		{"指定结束文件", []string{"-stop-file=mysql-bin.000005"}, false, true},
-		{"关闭优化", []string{"-auto-position=false"}, false, false},
-		{"MariaDB", []string{"-mysql-type=mariadb"}, false, false},
+		{"默认开启", nil, true, false, false},
+		{"显式默认起点", []string{"-start-pos=4"}, false, true, false},
+		{"显式默认终点", []string{"-stop-pos=4"}, false, true, false},
+		{"显式空文件", []string{"-start-file="}, false, true, false},
+		{"指定起始文件", []string{"-start-file=mysql-bin.000001"}, false, true, false},
+		{"指定结束文件", []string{"-stop-file=mysql-bin.000005"}, false, true, false},
+		{"裸开关", []string{"-auto-position"}, true, false, false},
+		{"窄窗口", []string{"-auto-position=narrow"}, true, false, true},
+		{"关闭优化", []string{"-auto-position=false"}, false, false, false},
+		{"MariaDB", []string{"-mysql-type=mariadb"}, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			args := append([]string{"-start-datetime=2026-09-01 10:00:00"}, tc.args...)
 			cfg := parseTestOptions(t, args...)
-			if cfg.ShouldAutoPosition() != tc.auto || cfg.ExplicitFilePos != tc.explicit {
+			if cfg.ShouldAutoPosition() != tc.auto || cfg.ExplicitFilePos != tc.explicit || cfg.NarrowWindow != tc.narrow {
 				t.Fatalf("自动定位参数不符: %+v", cfg)
 			}
 			if cfg.StartPos != 4 || !cfg.IfSetStartDateTime || cfg.BinlogTimeLocation != "UTC" {
@@ -104,6 +107,70 @@ func TestAutoPositionOptions(t *testing.T) {
 			t.Fatal("未处理单侧时间")
 		}
 	})
+}
+
+// flag.ContinueOnError 下 Parse 错误被忽略，取值映射直接单测 Set。
+func TestAutoPositionModeSet(t *testing.T) {
+	mode := &autoPositionMode{cfg: &ConfCmd{}}
+	for _, tc := range []struct {
+		value                string
+		auto, narrow, failed bool
+	}{
+		{"1", true, false, false},
+		{"T", true, false, false},
+		{"TRUE", true, false, false},
+		{"0", false, false, false},
+		{"F", false, false, false},
+		{"narrow", true, true, false},
+		{"Narrow", true, true, false},
+		{"fast", false, false, true},
+	} {
+		mode.cfg.AutoPosition, mode.cfg.NarrowWindow = false, false
+		err := mode.Set(tc.value)
+		if (err != nil) != tc.failed || mode.cfg.AutoPosition != tc.auto || mode.cfg.NarrowWindow != tc.narrow {
+			t.Fatalf("%q: err=%v auto=%v narrow=%v", tc.value, err, mode.cfg.AutoPosition, mode.cfg.NarrowWindow)
+		}
+	}
+}
+
+// flag 包打印用法时会用零值接收者调用 String，必须不 panic。
+func TestAutoPositionModeString(t *testing.T) {
+	var zero *autoPositionMode
+	if got := zero.String(); got != "false" {
+		t.Fatalf("零值接收者 String=%q", got)
+	}
+	if got := (&autoPositionMode{}).String(); got != "false" {
+		t.Fatalf("空 cfg String=%q", got)
+	}
+	for _, tc := range []struct {
+		auto, narrow bool
+		want         string
+	}{
+		{false, false, "false"},
+		{true, false, "true"},
+		{true, true, "narrow"},
+		{false, true, "false"},
+	} {
+		cfg := &ConfCmd{AutoPosition: tc.auto, NarrowWindow: tc.narrow}
+		if got := (&autoPositionMode{cfg: cfg}).String(); got != tc.want {
+			t.Fatalf("auto=%v narrow=%v String=%q，期望 %q", tc.auto, tc.narrow, got, tc.want)
+		}
+	}
+}
+
+func TestAutoPositionFlagShowsDefaultInUsage(t *testing.T) {
+	fs := flag.NewFlagSet("my2sql-test", flag.ContinueOnError)
+	var out bytes.Buffer
+	fs.SetOutput(&out)
+	fs.Var(&autoPositionMode{cfg: &ConfCmd{AutoPosition: true}}, "auto-position", "用法文本")
+	fs.PrintDefaults()
+	got := out.String()
+	if strings.Contains(got, "panic") {
+		t.Fatalf("打印用法触发 panic: %s", got)
+	}
+	if !strings.Contains(got, "auto-position") || !strings.Contains(got, "(default") {
+		t.Fatalf("未显示 auto-position 默认开启: %s", got)
+	}
 }
 
 func TestValidateBinlogOptions(t *testing.T) {

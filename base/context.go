@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,6 +100,7 @@ type ConfCmd struct {
 	FilterSqlLen    int
 
 	AutoPosition       bool
+	NarrowWindow       bool
 	ExplicitFilePos    bool
 	AutoStopBeforeFile string
 
@@ -178,6 +181,35 @@ type ConfCmd struct {
 	openOutput func(string) (io.WriteCloser, error)
 }
 
+// autoPositionMode 解析 -auto-position：兼容旧布尔取值，新增 narrow 快速模式。
+type autoPositionMode struct{ cfg *ConfCmd }
+
+// String 也会被 flag 包用于打印默认值，此时以零值接收者调用，必须容忍 m 或 m.cfg 为空。
+func (m *autoPositionMode) String() string {
+	if m == nil || m.cfg == nil || !m.cfg.AutoPosition {
+		return "false"
+	}
+	if m.cfg.NarrowWindow {
+		return "narrow"
+	}
+	return "true"
+}
+
+func (m *autoPositionMode) Set(v string) error {
+	if b, err := strconv.ParseBool(v); err == nil {
+		m.cfg.AutoPosition, m.cfg.NarrowWindow = b, false
+		return nil
+	}
+	if strings.EqualFold(v, "narrow") {
+		m.cfg.AutoPosition, m.cfg.NarrowWindow = true, true
+		return nil
+	}
+	return fmt.Errorf("invalid -auto-position %q: valid values are true, false, narrow", v)
+}
+
+// IsBoolFlag 使裸 -auto-position 仍等价于 true，与旧布尔 flag 行为一致。
+func (m *autoPositionMode) IsBoolFlag() bool { return true }
+
 func (this *ConfCmd) ParseCmdOptions() {
 	var (
 		version   bool
@@ -216,7 +248,8 @@ func (this *ConfCmd) ParseCmdOptions() {
 	flag.StringVar(&sqlTypes, "sql", "", StrSliceToString(GOptsValidFilterSql, C_joinSepComma, C_validOptMsg)+". only parse these types of sql, comma seperated, valid types are: insert, update, delete; default is all(insert,update,delete)")
 	flag.BoolVar(&this.IgnorePrimaryKeyForInsert, "ignore-primaryKey-forInsert", false, "for insert statement when -workType=2sql, ignore primary key")
 
-	flag.BoolVar(&this.AutoPosition, "auto-position", true, "纯时间解析时自动探测远程 MySQL 候选文件；抽样不保证覆盖所有乱序事件，设为 false 恢复原路径")
+	this.AutoPosition, this.NarrowWindow = true, false
+	flag.Var(&autoPositionMode{cfg: this}, "auto-position", "纯时间解析时自动探测远程 MySQL 候选文件；true|false|narrow，narrow 按候选窗口±2文件裁剪物理边界（快，依赖抽样代表性，可能漏乱序事件）；false 恢复从最早保留文件扫描")
 	flag.StringVar(&this.StartFile, "start-file", "", "binlog file to start reading")
 	flag.UintVar(&this.StartPos, "start-pos", 4, "start reading the binlog at position")
 	flag.StringVar(&this.StopFile, "stop-file", "", "binlog file to stop reading")

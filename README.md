@@ -152,10 +152,13 @@ default false, this is, use changed columns to build set part, use primary/uniqu
 - 查询不接受文件/Pos 参数，包括显式 `-start-pos 4`，请使用时间条件。探测失败保留错误行，退出状态非零，表示查询结果不完整。
 
 ### 纯时间解析自动定位
-`-auto-position` 默认开启：远程 MySQL 的 `2sql`、`rollback`、`stats` 只传时间条件、未显式指定文件/Pos 时，先展示探测候选范围，正式解析仍从最早保留文件 Pos 4 扫描到入口处的源快照，不用样本时间排除文件。
+`-auto-position` 默认开启，取值为 `true|false|narrow`。远程 MySQL 的 `2sql`、`rollback`、`stats` 只传时间条件、未显式指定文件/Pos 时，先展示探测候选范围：`true`（默认）保守全量，正式解析仍从最早保留文件 Pos 4 扫描到入口处的源快照，不用样本时间排除文件；`false` 跳过候选探测，仍从最早保留文件扫描；`narrow` 按候选窗口前后各留 2 个文件的物理边界解析（快速模式，见下）。
 
 ```sh
 ./my2sql -host 127.0.0.1 -user reader -work-type 2sql -start-datetime "2026-09-01 10:00:00" -stop-datetime "2026-09-01 11:00:00" -tl Asia/Shanghai -output-dir ./tmpdir
+
+# 快速模式：按候选窗口±2 个文件裁剪物理边界；范围之外的乱序事件不在覆盖内
+./my2sql -host 127.0.0.1 -user reader -work-type 2sql -start-datetime "2026-09-01 10:00:00" -stop-datetime "2026-09-01 11:00:00" -tl Asia/Shanghai -auto-position=narrow -output-dir ./tmpdir
 
 # 跳过候选探测，仍从最早保留文件扫描至固定的物理上界
 ./my2sql -host 127.0.0.1 -user reader -work-type 2sql -start-datetime "2026-09-01 10:00:00" -stop-datetime "2026-09-01 11:00:00" -tl Asia/Shanghai -auto-position=false -output-dir ./tmpdir
@@ -165,8 +168,9 @@ default false, this is, use changed columns to build set part, use primary/uniqu
 - 每个文件串行从 Pos 4 短暂探测，使用 raw 模式，不解析行数据；单文件最多消费 64 个事件、超时 5 秒，忽略 ROTATE、FORMAT_DESCRIPTION、GTID、PREVIOUS_GTIDS、HEARTBEAT 等控制事件。依赖存在异步预读，不保证只传事件头或严格限制网络字节数。
 - 目录探测成本为 O(文件数) 次短探测；展示的相交候选前后各保留一个相邻文件，同秒样本组不拆分。正式解析会扫描实际物理范围内的所有事件，其成本不受短探测上限约束。
 - 出现未知时间、探测失败或样本倒序时，告警并将候选退回全部保留文件。时间早于最早样本可能意味着更早日志已清理；晚于最新样本不代表没有记录。PURGE 导致目录变化时最多刷新重试一次，连续变化时报错。
-- 正式远程解析在未指定物理终点时固定入口处的源库 binlog 文件/位点快照；纯时间请求从最早保留文件开始，候选范围不用于裁剪扫描范围。未到达物理上界的读取空闲超时属于失败，不持续订阅未来日志。
-- 样本/估算不是精确首末时间，仅供目录查询参考，不能排除未采样的时间乱序。`-auto-position=false` 可跳过候选探测；显式指定文件/Pos 才能缩小物理扫描范围，该范围之外或已清理的事件不在覆盖保证内。
+- 正式远程解析在未指定物理终点时固定入口处的源库 binlog 文件/位点快照；纯时间请求默认从最早保留文件开始，候选范围不用于裁剪扫描范围（`-auto-position=narrow` 例外，见上文快速模式说明）。未到达物理上界的读取空闲超时属于失败，不持续订阅未来日志。
+- 样本/估算不是精确首末时间，仅供目录查询参考，不能排除未采样的时间乱序。`-auto-position=false` 可跳过候选探测；只有 `-auto-position=narrow` 或显式指定文件/Pos 才会缩小物理扫描范围，该范围之外或已清理的事件不在覆盖保证内。
+- `-auto-position=narrow` 快速模式：起点为候选前 2 个文件（不足则落到最早保留文件）的 Pos 4，终点为候选后 2 个文件 Pos 4 的排他边界（终点会越过列表末尾时改用入口处源快照）；出现未知时间、探测失败或样本倒序时自动回退保守全量定位并告警。裁剪范围之外的乱序事件不在覆盖内，需要精确控制物理范围时仍推荐显式 `-start-file`/`-stop-file`。
 - 查询需要 `REPLICATION CLIENT`、`REPLICATION SLAVE`（或服务端对应的复制权限）；生成 SQL 仍需表结构读取权限。`-server-id` 必须是非零 uint32 且在复制拓扑中唯一；探测与正式复制不会同时使用同一 ID。不执行轮转、清理或配置变更。
 
 ### 解析边界与失败处理
